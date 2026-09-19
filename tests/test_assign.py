@@ -288,3 +288,340 @@ def test_negative_capacity_rejected():
     }
     resp = client.post("/assign", json=body)
     assert resp.status_code == 422
+
+
+# ---------- 增量重排 ----------
+
+_INC_BASE = {
+    "manuscripts": [
+        {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1},
+    ],
+    "reviewers": [
+        {"id": "r1", "topics": ["t"], "capacity": 1},
+        {"id": "r2", "topics": ["t"], "capacity": 2},
+    ],
+}
+
+
+def test_incremental_reuses_previous_when_globally_feasible():
+    """历史关系本会占用关键容量时，全局重排复用它，而不是逐稿贪心推翻。"""
+    body = {
+        **_INC_BASE,
+        # m2 只有 r1 能满足（r2 容量可给 m1）；历史却是 m1->r1
+        "previous_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+    }
+    # r1 容量 1 时历史不可整体复用：m2 无其他可选（本例 r2 也可评 m2，故仍可行，
+    # 但复用 m1->r1 会使 m2->r2，复用数=1，是最优）
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r2"]}
+    st = data["reassignment"]
+    assert st == {"reused": 1, "added": 1, "removed": 0, "locked": 0, "total_changes": 1}
+
+
+def test_incremental_minimizes_added_and_removed():
+    """锁定关系强制让出容量时：m1 被改为 r2，历史 m1->r1 记为移除、m1->r2 记新增。"""
+    body = {
+        **_INC_BASE,
+        "previous_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+        "locked_assignments": [{"manuscript_id": "m2", "reviewer_id": "r1"}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r2"], "m2": ["r1"]}
+    assert data["reassignment"] == {
+        "reused": 0, "added": 2, "removed": 1, "locked": 1, "total_changes": 3
+    }
+
+
+def test_incremental_invalid_previous_pair_is_naturally_dropped():
+    """历史关系已不再满足资格（主题冲突）：自然失效，计为移除，不判不可行。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["db"], "capacity": 1},
+            {"id": "r2", "topics": ["ml"], "capacity": 1},
+        ],
+        "previous_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["assignments"][0]["reviewer_ids"] == ["r2"]
+    assert data["reassignment"]["reused"] == 0
+    assert data["reassignment"]["removed"] == 1
+    assert data["reassignment"]["added"] == 1
+
+
+def test_incremental_tie_break_is_id_order_and_deterministic():
+    """历史关系与新增名额互不竞争时，新增边在同成本解之间按 ID 顺序决胜；
+    评审人 / 稿件列表乱序不影响结果。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "topics": ["t1"], "required_reviewers": 1},
+            {"id": "m2", "topics": ["t2"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r2", "topics": ["t1", "t2"], "capacity": 2},
+            {"id": "r1", "topics": ["t1"], "capacity": 1},
+        ],
+        # m2 唯一可选 r2（r1 无 t2 能力），复用与 m1 的选择互不竞争；
+        # m1 可在 r1/r2 间任选，rank 更小的 r1 胜出
+        "previous_assignments": [{"manuscript_id": "m2", "reviewer_id": "r2"}],
+    }
+    r1 = client.post("/assign", json=body).json()
+    shuffled = {
+        **body,
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+    }
+    r2 = client.post("/assign", json=shuffled).json()
+    assert r1 == r2
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in r1["assignments"]}
+    assert assignments["m1"] == ["r1"]
+    assert assignments["m2"] == ["r2"]
+    assert r1["reassignment"] == {
+        "reused": 1, "added": 1, "removed": 0, "locked": 0, "total_changes": 1
+    }
+
+
+def test_locked_feasible_is_enforced():
+    body = {
+        **_INC_BASE,
+        "locked_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments["m1"] == ["r1"]
+    assert data["reassignment"]["locked"] == 1
+
+
+def test_locked_ineligible_returns_structured_conflict_no_partial():
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["ml"], "capacity": 2,
+             "conflicted_authors": ["alice"]},
+            {"id": "r2", "topics": ["ml"], "capacity": 2},
+        ],
+        "locked_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None  # 不输出部分分配
+    assert data["reassignment"] is None
+    conflict = data["lock_conflicts"][0]
+    assert conflict["code"] == "ineligible_author_conflict"
+    assert conflict["manuscript_id"] == "m1"
+    assert conflict["reviewer_id"] == "r1"
+    assert conflict["detail"]
+
+
+def test_locked_over_required_returns_structured_conflict():
+    body = {
+        "manuscripts": [
+            {"id": "m1", "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5},
+            {"id": "r2", "topics": ["t"], "capacity": 5},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_id": "r1"},
+            {"manuscript_id": "m1", "reviewer_id": "r2"},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    c = next(c for c in data["lock_conflicts"] if c["code"] == "over_required")
+    assert c["manuscript_id"] == "m1"
+    assert c["locked_count"] == 2
+    assert c["limit"] == 1
+    assert c["related_ids"] == ["r1", "r2"]
+
+
+def test_locked_over_capacity_returns_structured_conflict():
+    body = {
+        **_INC_BASE,
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_id": "r1"},
+            {"manuscript_id": "m2", "reviewer_id": "r1"},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    c = next(c for c in data["lock_conflicts"] if c["code"] == "over_capacity")
+    assert c["reviewer_id"] == "r1"
+    assert c["locked_count"] == 2
+    assert c["limit"] == 1
+    assert c["related_ids"] == ["m1", "m2"]
+
+
+def test_locked_feasible_but_globally_infeasible_gives_gap_diagnosis():
+    """锁本身合法，但锁定占满唯一容量后其余需求无解：走缺口诊断，不输出部分结果。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "topics": ["t"], "required_reviewers": 2},
+            {"id": "m2", "topics": ["t"], "required_reviewers": 2},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 3},
+        ],
+        "locked_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    assert data["lock_conflicts"] is None
+    assert data["total_required"] == 4
+    assert data["total_assigned"] == 3
+    unsat = {u["manuscript_id"]: u for u in data["unsatisfied"]}
+    assert set(unsat) == {"m2"}
+
+
+def test_locked_self_author_conflict_structured():
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["r1"], "topics": ["t"],
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+        "locked_assignments": [{"manuscript_id": "m1", "reviewer_id": "r1"}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["lock_conflicts"][0]["code"] == "ineligible_self_author"
+
+
+def test_locked_conflicts_reports_all_categories_deterministically():
+    """资格冲突 / 超额需求 / 超容量互不关联时，一次返回全部三类原因，顺序确定。"""
+    body = {
+        "manuscripts": [
+            # m1：只需要 1 人却锁定 2 人（r1、r2 均合格）—— over_required
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            # m2：锁定 r3（主题不符）—— ineligible_topics
+            {"id": "m2", "authors": [], "topics": ["ml"], "required_reviewers": 1},
+            # m3 / m4：都合法锁定 r1（r1 容量 1）—— over_capacity
+            {"id": "m3", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            {"id": "m4", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t", "ml"], "capacity": 1},
+            {"id": "r2", "topics": ["t", "ml"], "capacity": 5},
+            {"id": "r3", "topics": ["db"], "capacity": 5},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_id": "r1"},
+            {"manuscript_id": "m1", "reviewer_id": "r2"},
+            {"manuscript_id": "m2", "reviewer_id": "r3"},
+            {"manuscript_id": "m3", "reviewer_id": "r1"},
+            {"manuscript_id": "m4", "reviewer_id": "r1"},
+        ],
+    }
+    r_a = client.post("/assign", json=body).json()
+    shuffled = {
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+        "locked_assignments": list(reversed(body["locked_assignments"])),
+    }
+    r_b = client.post("/assign", json=shuffled).json()
+    assert r_a == r_b
+    assert r_a["assignments"] is None
+    codes = [c["code"] for c in r_a["lock_conflicts"]]
+    # 输出顺序：资格类 -> over_required -> over_capacity，各组内按 ID 排序
+    assert codes == [
+        "ineligible_topics",
+        "over_required",
+        "over_capacity",
+    ]
+    cap = next(c for c in r_a["lock_conflicts"] if c["code"] == "over_capacity")
+    assert cap["reviewer_id"] == "r1"
+    assert cap["locked_count"] == 3
+    assert cap["limit"] == 1
+    assert cap["related_ids"] == ["m1", "m3", "m4"]
+
+
+def test_incremental_unknown_manuscript_id_rejected():
+    body = {
+        "manuscripts": [{"id": "m1", "topics": ["t"]}],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+        "previous_assignments": [
+            {"manuscript_id": "mX", "reviewer_id": "r1"}
+        ],
+    }
+    assert client.post("/assign", json=body).status_code == 422
+
+
+def test_incremental_unknown_reviewer_id_in_locked_rejected():
+    body = {
+        "manuscripts": [{"id": "m1", "topics": ["t"]}],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+        "locked_assignments": [{"manuscript_id": "m1", "reviewer_id": "rX"}],
+    }
+    assert client.post("/assign", json=body).status_code == 422
+
+
+def test_duplicate_previous_pair_rejected():
+    pair = {"manuscript_id": "m1", "reviewer_id": "r1"}
+    body = {
+        "manuscripts": [{"id": "m1", "topics": ["t"]}],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 2}],
+        "previous_assignments": [pair, dict(pair)],
+    }
+    assert client.post("/assign", json=body).status_code == 422
+
+
+def test_empty_incremental_lists_keep_normal_response_shape():
+    """previous/locked 均为空（或缺省）时响应与普通请求逐字段兼容。"""
+    body = {
+        "manuscripts": [{"id": "m1", "topics": ["t"]}],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+        "previous_assignments": [],
+        "locked_assignments": [],
+    }
+    plain = client.post("/assign", json={
+        "manuscripts": body["manuscripts"], "reviewers": body["reviewers"]
+    }).json()
+    inc = client.post("/assign", json=body).json()
+    assert inc == plain
+    assert inc["reassignment"] is None
+    assert inc["lock_conflicts"] is None
+
+
+def test_incremental_deterministic_under_input_shuffle():
+    body = _random_instance(seed=99)
+    seen = set()
+    prev = []
+    for m in body["manuscripts"]:
+        for j in range(m.get("required_reviewers", 2)):
+            pair = {"manuscript_id": m["id"], "reviewer_id": f"r{(j + 3) % 15}"}
+            key = (pair["manuscript_id"], pair["reviewer_id"])
+            if key not in seen:
+                seen.add(key)
+                prev.append(pair)
+    body["previous_assignments"] = prev
+    # 仅打乱列表顺序；增量字段两个请求保持一致
+    shuffled = {
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+        "previous_assignments": list(reversed(body["previous_assignments"])),
+    }
+    r1 = client.post("/assign", json=body).json()
+    r2 = client.post("/assign", json=shuffled).json()
+    assert r1["status"] == r2["status"] == "feasible"
+    assert r1 == r2

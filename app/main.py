@@ -5,9 +5,11 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .models import (
+    AssignmentIn,
     AssignmentOut,
     AssignRequest,
     AssignResponse,
+    LockedConflictOut,
     SharedPoolOut,
     UnsatisfiedOut,
 )
@@ -15,11 +17,13 @@ from .solver import ManuscriptSpec, ReviewerSpec, solve_assignment
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断且不输出部分结果。"
-        "服务无状态，不持久化任何稿件/评审信息。"
+        "支持增量重排：携带 previous_assignments / locked_assignments 时，"
+        "锁定关系经稿件需求、评审资格与容量校验后强制保留，其余名额在全局可行"
+        "前提下最少改动地复用上一轮分配。服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
 
@@ -37,6 +41,17 @@ def root() -> dict:
         "docs": "/docs",
         "health": "/health",
     }
+
+
+def _to_pair_set(
+    items: list[AssignmentIn] | None,
+) -> frozenset[tuple[str, str]] | None:
+    """把 AssignmentIn 列表展开为 (manuscript_id, reviewer_id) 对集合（自动去重）。"""
+    if items is None:
+        return None
+    return frozenset(
+        (a.manuscript_id, rid) for a in items for rid in set(a.reviewer_ids)
+    )
 
 
 @app.post("/assign", response_model=AssignResponse, tags=["assign"])
@@ -66,7 +81,26 @@ def assign(req: AssignRequest) -> AssignResponse:
         for r in req.reviewers
     ]
 
-    result = solve_assignment(manuscripts, reviewers)
+    result = solve_assignment(
+        manuscripts,
+        reviewers,
+        previous=_to_pair_set(req.previous_assignments),
+        locked=_to_pair_set(req.locked_assignments),
+    )
+
+    # 锁定关系冲突：结构化原因，不输出任何部分分配
+    if result.locked_conflicts:
+        return AssignResponse(
+            status="infeasible",
+            total_required=result.total_required,
+            total_assigned=result.total_assigned,
+            assignments=None,
+            unsatisfied=None,
+            shared_pool=None,
+            locked_conflicts=[
+                LockedConflictOut(**vars(c)) for c in result.locked_conflicts
+            ],
+        )
 
     if result.feasible:
         return AssignResponse(
@@ -79,6 +113,7 @@ def assign(req: AssignRequest) -> AssignResponse:
             ],
             unsatisfied=None,
             shared_pool=None,
+            locked_conflicts=None,
         )
 
     return AssignResponse(
@@ -88,4 +123,5 @@ def assign(req: AssignRequest) -> AssignResponse:
         assignments=None,
         unsatisfied=[UnsatisfiedOut(**vars(u)) for u in result.unsatisfied],
         shared_pool=SharedPoolOut(**result.shared_pool) if result.shared_pool else None,
+        locked_conflicts=None,
     )

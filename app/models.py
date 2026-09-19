@@ -33,6 +33,18 @@ class ReviewerIn(BaseModel):
     )
 
 
+class AssignmentIn(BaseModel):
+    """一组「稿件 -> 评审人」关系（previous / locked 通用）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_ids: list[str] = Field(
+        min_length=1, max_length=10000,
+        description="分配给该稿件的评审人 ID 列表（重复项自动去重）",
+    )
+
+
 class AssignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -41,6 +53,21 @@ class AssignRequest(BaseModel):
     required_reviewers: int = Field(
         default=1, ge=0, le=100,
         description="每稿默认所需评审数（稿件级 required_reviewers 可覆盖）",
+    )
+    previous_assignments: list[AssignmentIn] | None = Field(
+        default=None, max_length=10000,
+        description=(
+            "上一轮分配结果（增量重排模式）。提供后，求解在保证全局可行的前提下"
+            "尽量复用这些关系，使新增 + 移除的关系总数最少；引用已不存在的"
+            "稿件/评审人的关系自动忽略"
+        ),
+    )
+    locked_assignments: list[AssignmentIn] | None = Field(
+        default=None, max_length=10000,
+        description=(
+            "必须保留的锁定分配（增量重排模式）。任一锁定关系不满足稿件需求、"
+            "评审资格或容量约束时，整体判定不可行并返回结构化冲突原因"
+        ),
     )
 
     @model_validator(mode="after")
@@ -78,6 +105,27 @@ class SharedPoolOut(BaseModel):
     pool_total_capacity: int
 
 
+class LockedConflictOut(BaseModel):
+    """一条锁定关系冲突的结构化原因。"""
+
+    type: Literal[
+        "unknown_manuscript",
+        "unknown_reviewer",
+        "self_conflict",
+        "author_conflict",
+        "manuscript_conflict",
+        "topic_mismatch",
+        "reviewer_capacity_exceeded",
+        "manuscript_requirement_exceeded",
+    ]
+    manuscript_id: str | None = None
+    reviewer_id: str | None = None
+    # 仅容量/需求类冲突携带：实际锁定数与上限
+    locked: int | None = None
+    limit: int | None = None
+    detail: str
+
+
 class AssignResponse(BaseModel):
     status: Literal["feasible", "infeasible"]
     total_required: int
@@ -87,3 +135,5 @@ class AssignResponse(BaseModel):
     # 不可行时给出缺口诊断；可行时为 null
     unsatisfied: list[UnsatisfiedOut] | None
     shared_pool: SharedPoolOut | None
+    # 锁定关系冲突（仅增量重排模式且锁定不可行时非空）；否则为 null
+    locked_conflicts: list[LockedConflictOut] | None = None
